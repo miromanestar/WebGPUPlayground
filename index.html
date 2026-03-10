@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>WebGPU Globe Demo</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    html,body { height: 100%; margin: 0; background: #111; color: #ddd; font-family: system-ui, -apple-system, Roboto, "Segoe UI", "Helvetica Neue", Arial; }
+    #container { display:flex; flex-direction:column; height:100%; }
+    header { padding: 10px 14px; background: #0f0f12; display:flex; align-items:center; gap:12px; }
+    header h1 { font-size:16px; margin:0; color:#fff; }
+    #controls { margin-left:auto; display:flex; gap:10px; align-items:center; color:#bbb; font-size:13px; }
+    canvas { flex:1; display:block; width:100%; height:100%; }
+    .small { font-size:12px; color:#9aa; }
+    a { color:#7fc; }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <header>
+      <h1>WebGPU Globe</h1>
+      <div id="controls">
+        <div class="small">Drag to rotate • Scroll to zoom</div>
+      </div></body></header></h1>
+    </header>
+
+    <canvas id="gpu-canvas"></canvas>
+  </div>
+
+  <script type="module">
+  // WebGPU Globe demo - single-file page
+  // Notes:
+  // - Requires a browser with WebGPU enabled (Chrome/Edge/Firefox with the flag).
+  // - Uses an external Earth texture (equirectangular). You may replace the URL with another image.
+
+  const canvas = document.getElementById('gpu-canvas');
+
+  // Choose an earth texture (publicly hosted). You can replace with another URL.
+  const EARTH_URL = 'https://upload.wikimedia.org/wikipedia/commons/6/6f/Earth_Eastern_Hemisphere.jpg';
+
+  // Basic camera / interaction state
+  let camera = {
+    distance: 3.0,
+    rotationX: 0.3, // pitch
+    rotationY: 0.6, // yaw
+  };
+
+  let isDragging = false;
+  let lastPointer = { x: 0, y: 0 };
+
+  canvas.addEventListener('pointerdown', (e) => {
+    isDragging = true;
+    lastPointer.x = e.clientX;
+    lastPointer.y = e.clientY;
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!isDragging) return;
+    const dx = e.clientX - lastPointer.x;
+    const dy = e.clientY - lastPointer.y;
+    lastPointer.x = e.clientX;
+    lastPointer.y = e.clientY;
+    camera.rotationY += dx * 0.005;
+    camera.rotationX += dy * 0.005;
+    camera.rotationX = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, camera.rotationX));
+  });
+  canvas.addEventListener('pointerup', (e) => {
+    isDragging = false;
+    canvas.releasePointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('wheel', (e) => {
+    camera.distance *= (1 + e.deltaY * 0.001);
+    camera.distance = Math.max(1.2, Math.min(10, camera.distance));
+  }, { passive: true });
+
+  // Small linear algebra helpers (minimal, optimized for clarity)
+  function degToRad(d){ return d * Math.PI / 180; }
+
+  function mat4_identity(){
+    return new Float32Array([1,0,0,0,  0,1,0,0,  0,0,1,0,  0,0,0,1]);
+  }
+
+  function mat4_mul(a,b){
+    const out = new Float32Array(16);
+    for (let i=0;i<4;i++){
+      for (let j=0;j<4;j++){
+        let s=0;
+        for (let k=0;k<4;k++) s += a[i*4+k]*b[k*4+j];
+        out[i*4+j]=s;
+      }
+    }
+    return out;
+  }
+
+  function mat4_translate(tx,ty,tz){
+    const m = mat4_identity();
+    m[12]=tx; m[13]=ty; m[14]=tz;
+    return m;
+  }
+
+  function mat4_rotateX(a){
+    const c=Math.cos(a), s=Math.sin(a);
+    const m = mat4_identity();
+    m[5]=c; m[6]=s;
+    m[9]=-s; m[10]=c;
+    return m;
+  }
+
+  function mat4_rotateY(a){
+    const c=Math.cos(a), s=Math.sin(a);
+    const m = mat4_identity();
+    m[0]=c; m[2]=-s;
+    m[8]=s; m[10]=c;
+    return m;
+  }
+
+  function mat4_perspective(fovy, aspect, near, far){
+    const f = 1.0 / Math.tan(fovy/2);
+    const nf = 1/(near - far);
+    const out = new Float32Array(16);
+    out[0] = f / aspect;
+    out[1] = 0;
+    out[2] = 0;
+    out[3] = 0;
+
+    out[4] = 0;
+    out[5] = f;
+    out[6] = 0;
+    out[7] = 0;
+
+    out[8] = 0;
+    out[9] = 0;
+    out[10] = (far + near) * nf;
+    out[11] = -1;
+
+    out[12] = 0;
+    out[13] = 0;
+    out[14] = (2 * far * near) * nf;
+    out[15] = 0;
+    return out;
+  }
+
+  // Produce a sphere mesh (positions, normals, uvs, indices)
+  function createSphereMesh(latBands = 64, longBands = 64, radius = 1.0){
+    const positions = [];
+    const normals = [];
+    const uvs = [];
+    const indices = [];
+
+    for (let lat = 0; lat <= latBands; lat++){
+      const theta = lat * Math.PI / latBands;
+      const sinTheta = Math.sin(theta);
+      const cosTheta = Math.cos(theta);
+
+      for (let lon = 0; lon <= longBands; lon++){
+        const phi = lon * 2 * Math.PI / longBands;
+        const sinPhi = Math.sin(phi);
+        const cosPhi = Math.cos(phi);
+
+        const x = cosPhi * sinTheta;
+        const y = cosTheta;
+        const z = sinPhi * sinTheta;
+        const u = 1 - (lon / longBands);
+        const v = 1 - (lat / latBands);
+
+        positions.push(radius * x, radius * y, radius * z);
+        normals.push(x, y, z);
+        uvs.push(u, v);
+      }
+    }
+
+    for (let lat = 0; lat < latBands; lat++){
+      for (let lon = 0; lon < longBands; lon++){
+        const first = (lat * (longBands + 1)) + lon;
+        const second = first + longBands + 1;
+        indices.push(first, second, first + 1);
+        indices.push(second, second + 1, first + 1);
+      }
+    }
+
+    return {
+      position: new Float32Array(positions),
+      normal: new Float32Array(normals),
+      uv: new Float32Array(uvs),
+      index: indices.length > 65535 ? new Uint32Array(indices) : new Uint16Array(indices)
+    };
+  }
+
+  // WGSL shaders
+  const wgslVertex = `struct Uniforms {
+    mvp : mat4x4<f32>,
+    model : mat4x4<f32>,
+    lightDir : vec3<f32>,
+    _pad : f32,
+};
+@binding(0) @group(0) var<uniform> uniforms : Uniforms;
+
+struct VSOut {
+  @location(0) uv : vec2<f32>,
+  @location(1) normal : vec3<f32>,
+  @builtin(position) Position : vec4<f32>,
+};
+
+@vertex
+fn main(
+  @location(0) position : vec3<f32>,
+  @location(1) normal : vec3<f32>,
+  @location(2) uv : vec2<f32>
+) -> VSOut {
+  var out : VSOut;
+  out.Position = uniforms.mvp * vec4<f32>(position, 1.0);
+  // transform normal by model (assuming uniform scale)
+  out.normal = (uniforms.model * vec4<f32>(normal, 0.0)).xyz;
+  out.uv = uv;
+  return out;
+}
+`;
+
+  const wgslFragment = `@binding(1) @group(0) var earthTex : texture_2d<f32>;
+@binding(2) @group(0) var earthSampler : sampler;
+
+struct Uniforms {
+  mvp : mat4x4<f32>,
+  model : mat4x4<f32>,
+  lightDir : vec3<f32>,
+  _pad : f32,
+};
+@binding(0) @group(0) var<uniform> uniforms : Uniforms;
+
+@fragment
+fn main(
+  @location(0) uv : vec2<f32>,
+  @location(1) normal : vec3<f32>
+) -> @location(0) vec4<f32> {
+  let n = normalize(normal);
+  let light = normalize(uniforms.lightDir);
+  // simple lambert + ambient
+  let diff = max(dot(n, light), 0.0);
+  let ambient = 0.18;
+  let tex = textureSample(earthTex, earthSampler, uv);
+  // slightly boost colors and mix with ambient
+  let color = tex.rgb * (ambient + diff * 0.85);
+  // subtle rim lighting
+  let rim = pow(1.0 - max(dot(n, vec3<f32>(0.0, 0.0, 1.0)), 0.0), 3.0) * 0.07;
+  return vec4<f32>(color + rim, tex.a);
+}
+`;
+
+  async function initWebGPU() {
+    if (!navigator.gpu) {
+      document.body.innerHTML = '<div style="padding:20px;color:#f88">WebGPU not available in this browser. Use a compatible build with WebGPU enabled.</div>';
+      throw new Error('WebGPU not available');
+    }
+
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) throw new Error('Failed to get GPU adapter');
+    const device = await adapter.requestDevice();
+
+    const context = canvas.getContext('webgpu');
+    const devicePixelRatio = Math.max(1, window.devicePixelRatio || 1);
+
+    function configureSwapChain() {
+      const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+      canvas.width = Math.floor(canvas.clientWidth * devicePixelRatio);
+      canvas.height = Math.floor(canvas.clientHeight * devicePixelRatio);
+      context.configure({
+        device,
+        format: presentationFormat,
+        alphaMode: 'opaque'
+      });
+      return presentationFormat;
+    }
+
+    const presentationFormat = configureSwapChain();
+
+    // Create the globe mesh
+    const mesh = createSphereMesh(80, 80, 1.0);
+
+    // Interleave vertex data: pos(3), normal(3), uv(2)
+    const vertexCount = mesh.position.length / 3;
+    const vertexStride = (3 + 3 + 2) * 4; // bytes
+    const vertexBuffer = device.createBuffer({
+      size: vertexCount * vertexStride,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+    });
+
+    // Build interleaved buffer
+    const interleaved = new Float32Array(vertexCount * (3+3+2));
+    for (let i=0;i<vertexCount;i++){
+      interleaved[i*8 + 0] = mesh.position[i*3 + 0];
+      interleaved[i*8 + 1] = mesh.position[i*3 + 1];
+      interleaved[i*8 + 2] = mesh.position[i*3 + 2];
+
+      interleaved[i*8 + 3] = mesh.normal[i*3 + 0];
+      interleaved[i*8 + 4] = mesh.normal[i*3 + 1];
+      interleaved[i*8 + 5] = mesh.normal[i*3 + 2];
+
+      interleaved[i*8 + 6] = mesh.uv[i*2 + 0];
+      interleaved[i*8 + 7] = mesh.uv[i*2 + 1];
+    }
+
+    device.queue.writeBuffer(vertexBuffer, 0, interleaved.buffer, interleaved.byteOffset, interleaved.byteLength);
+
+    // Index buffer
+    const indexBuffer = device.createBuffer({
+      size: mesh.index.byteLength,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST
+    });
+    device.queue.writeBuffer(indexBuffer, 0, mesh.index.buffer, mesh.index.byteOffset, mesh.index.byteLength);
+
+    // Uniform buffer (mvp, model, lightDir + padding)
+    // 4x4 + 4x4 + vec3 + pad = 16*4 + 16*4 + 4*4 = 128 + 128 + 16 = 272 bytes -> align to 256? WebGPU alignment rules: uniform buffer offset must be multiple of 256 for dynamic binds, but here static and single uniform OK.
+    const uniformBufferSize = 16*4 + 16*4 + 4*4; // 272 bytes
+    const uniformBuffer = device.createBuffer({
+      size: Math.ceil(uniformBufferSize/256)*256, // round up to 256 for portability
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+
+    // Load earth image and create GPU texture
+    const img = await loadImageBitmap(EARTH_URL);
+    const earthTexture = device.createTexture({
+      size: [img.width, img.height, 1],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT
+    });
+    device.queue.copyExternalImageToTexture(
+      { source: img },
+      { texture: earthTexture },
+      [img.width, img.height]
+    );
+
+    const sampler = device.createSampler({
+      magFilter: 'linear',
+      minFilter: 'linear',
+      mipmapFilter: 'linear',
+      addressModeU: 'repeat',
+      addressModeV: 'repeat'
+    });
+
+    const uniformBindGroupLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } }
+      ]
+    });
+
+    const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [uniformBindGroupLayout] });
+
+    // Create shader modules
+    const vertModule = device.createShaderModule({ code: wgslVertex });
+    const fragModule = device.createShaderModule({ code: wgslFragment });
+
+    // Pipeline
+    const pipeline = device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex: {
+        module: vertModule,
+        entryPoint: 'main',
+        buffers: [
+          {
+            arrayStride: vertexStride,
+            attributes: [
+              { shaderLocation: 0, offset: 0, format: 'float32x3' }, // position
+              { shaderLocation: 1, offset: 12, format: 'float32x3' }, // normal
+              { shaderLocation: 2, offset: 24, format: 'float32x2' }, // uv
+            ]
+          }
+        ]
+      },
+      fragment: {
+        module: fragModule,
+        entryPoint: 'main',
+        targets: [
+          { format: presentationFormat }
+        ]
+      },
+      primitive: {
+        topology: 'triangle-list',
+        cullMode: 'back'
+      },
+      depthStencil: {
+        format: 'depth24plus',
+        depthWriteEnabled: true,
+        depthCompare: 'less'
+      }
+    });
+
+    const depthTexture = device.createTexture({
+      size: [canvas.width, canvas.height, 1],
+      format: 'depth24plus',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT
+    });
+
+    const bindGroup = device.createBindGroup({
+      layout: uniformBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuffer } },
+        { binding: 1, resource: earthTexture.createView() },
+        { binding: 2, resource: sampler }
+      ]
+    });
+
+    function resize() {
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      canvas.width = Math.floor(canvas.clientWidth * dpr);
+      canvas.height = Math.floor(canvas.clientHeight * dpr);
+
+      context.configure({ device, format: presentationFormat, alphaMode: 'opaque' });
+
+      // Recreate depth texture
+      // Note: recreate each resize to match size
+      // (For simplicity, we recreate unconditionally here)
+    }
+
+    window.addEventListener('resize', () => {
+      resize();
+    });
+
+    // Update uniforms and draw
+    let lastTime = performance.now();
+
+    function updateUniforms() {
+      const aspect = canvas.width / canvas.height;
+      const proj = mat4_perspective(Math.PI/4, aspect, 0.1, 100.0);
+
+      // camera transform: translate back, rotate X then Y
+      let view = mat4_translate(0, 0, -camera.distance);
+      view = mat4_mul(mat4_rotateX(camera.rotationX), view);
+      view = mat4_mul(mat4_rotateY(camera.rotationY), view);
+
+      // model matrix (slight rotation for nice presentation)
+      const model = mat4_identity();
+      // mvp = proj * view * model
+      const mv = mat4_mul(view, model);
+      const mvp = mat4_mul(proj, mv);
+
+      // light direction (in model space/or world space) - point light from camera direction
+      const lightDir = new Float32Array([0.5, 0.6, 0.7]);
+
+      // Pack uniforms: mvp (16 floats), model (16 floats), lightDir (3 floats) + pad
+      const u8 = new ArrayBuffer(16*4 + 16*4 + 4*4);
+      const f32 = new Float32Array(u8);
+      let offset = 0;
+      f32.set(mvp, offset); offset += 16;
+      f32.set(model, offset); offset += 16;
+      f32.set(lightDir, offset); offset += 3;
+      f32[offset] = 0.0;
+
+      device.queue.writeBuffer(uniformBuffer, 0, u8);
+    }
+
+    function frame() {
+      updateUniforms();
+
+      const commandEncoder = device.createCommandEncoder();
+      const textureView = context.getCurrentTexture().createView();
+
+      // Recreate depth texture with current size to ensure correct size (cheap path)
+      const depthView = device.createTexture({
+        size: [canvas.width, canvas.height, 1],
+        format: 'depth24plus',
+        usage: GPUTextureUsage.RENDER_ATTACHMENT
+      }).createView();
+
+      const renderPassDescriptor = {
+        colorAttachments: [{
+          view: textureView,
+          clearValue: { r: 0.03, g: 0.04, b: 0.07, a: 1.0 },
+          loadOp: 'clear',
+          storeOp: 'store'
+        }],
+        depthStencilAttachment: {
+          view: depthView,
+          depthClearValue: 1.0,
+          depthLoadOp: 'clear',
+          depthStoreOp: 'store'
+        }
+      };
+
+      const pass = commandEncoder.beginRenderPass(renderPassDescriptor);
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.setVertexBuffer(0, vertexBuffer);
+      pass.setIndexBuffer(indexBuffer, mesh.index instanceof Uint32Array ? 'uint32' : 'uint16');
+      pass.drawIndexed(mesh.index.length, 1, 0, 0, 0);
+      pass.end();
+
+      device.queue.submit([commandEncoder.finish()]);
+      requestAnimationFrame(frame);
+    }
+
+    requestAnimationFrame(frame);
+
+    // Utility: load image as ImageBitmap (works with CORS-hosted images)
+    async function loadImageBitmap(url){
+      const resp = await fetch(url, {mode: 'cors'});
+      if (!resp.ok) throw new Error('Failed to fetch image');
+      const blob = await resp.blob();
+      return await createImageBitmap(blob);
+    }
+
+    // initial resize/configure
+    resize();
+  }
+
+  // Kick off
+  initWebGPU().catch(err => {
+    console.error(err);
+  });
+  </script>
+</body>
+</html>
